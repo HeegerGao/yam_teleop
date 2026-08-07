@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "VitePress Dev",
+      "runtimeExecutable": "/bin/bash",
+      "runtimeArgs": ["-c", "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH && cd '/Users/zhongkeyi/Library/Mobile Documents/com~apple~CloudDocs/Work/i2rt/doc/web' && npm run docs:dev"],
+      "port": 5173
+    },
+    {
+      "name": "VitePress Preview",
+      "runtimeExecutable": "/bin/bash",
+      "runtimeArgs": ["-c", "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH && cd '/Users/zhongkeyi/Library/Mobile Documents/com~apple~CloudDocs/Work/i2rt/doc/web' && npm run docs:preview"],
+      "port": 4173
+    }
+  ]
+}
