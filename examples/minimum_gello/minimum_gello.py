@@ -28,6 +28,19 @@ _WORKER_LOOP_PERIOD_S = 0.002
 get_info return instantly). Without it these loops peg a CPU core; the actual YAM
 hardware/control thread updates at ~250 Hz, well below this cap, so no data is lost."""
 
+_RPC_TIMEOUT_S = 2.0
+"""Per-call ceiling for every follower RPC. Generous next to a sub-millisecond loopback
+round trip: it is a liveness check, not a latency budget."""
+
+_FOLLOWER_STARTUP_TIMEOUT_S = 60.0
+"""How long the leader retries its first follower read before giving up. Covers a follower
+that is still coming up (gripper calibration) when the leader starts."""
+
+_RPC_ERRORS_BEFORE_RECONNECT = 20
+"""Consecutive failed RPCs (~4 s at _RPC_TIMEOUT_S, less when they fail fast) before the
+leader redials the follower. High enough to ride out a blip, low enough that a connection
+which has stopped answering is replaced while the operator is still holding the leader."""
+
 
 # ---------------------------------------------------------------------------
 # Adapters
@@ -35,29 +48,67 @@ hardware/control thread updates at ~250 Hz, well below this cap, so no data is l
 
 
 class ClientRobot(Robot):
-    """A simple client for a leader robot."""
+    """A simple client for a leader robot.
 
-    def __init__(self, port: int = DEFAULT_ROBOT_PORT, host: str = "127.0.0.1"):
-        self._client = portal.Client(f"{host}:{port}")
+    Every call is bounded and consumes its future. portal gives us two blocking paths that
+    never time out and never log: ``Future.result()`` defaults to waiting forever, and
+    ``Client.call`` parks in an untimed ``cond.wait`` loop once ``maxinflight`` (16) futures
+    are still pending (portal/client.py:66). A fire-and-forget command whose response is lost
+    therefore wedges the *caller* permanently and silently -- which is what froze both
+    followers mid-teleop. Waiting for each response keeps at most one request in flight, so
+    that limit is unreachable, and a stall surfaces as a TimeoutError the caller can act on."""
+
+    def __init__(
+        self, port: int = DEFAULT_ROBOT_PORT, host: str = "127.0.0.1", timeout: float = _RPC_TIMEOUT_S
+    ) -> None:
+        self._addr = f"{host}:{port}"
+        self._timeout = timeout
+        self._client = portal.Client(self._addr)
+
+    def _connected(self) -> None:
+        """Raise instead of blocking when the socket is down.
+
+        The third untimed path in portal: ``Client.call`` sends before it ever builds a future,
+        and that send waits on the connection with no timeout at all, so a follower that goes
+        away parks the caller indefinitely. ``connect`` is the bounded form of the same wait."""
+        if not self._client.connect(timeout=self._timeout):
+            raise TimeoutError(f"not connected to {self._addr}")
 
     def num_dofs(self) -> int:
-        return self._client.num_dofs().result()
+        self._connected()
+        return self._client.num_dofs().result(timeout=self._timeout)
 
     def get_joint_pos(self) -> np.ndarray:
-        return self._client.get_joint_pos().result()
+        self._connected()
+        return self._client.get_joint_pos().result(timeout=self._timeout)
 
     def command_joint_pos(self, joint_pos: np.ndarray) -> None:
-        self._client.command_joint_pos(joint_pos)
+        self._connected()
+        self._client.command_joint_pos(joint_pos).result(timeout=self._timeout)
 
     def command_joint_state(self, joint_state: Dict[str, np.ndarray]) -> None:
-        self._client.command_joint_state(joint_state)
+        self._connected()
+        self._client.command_joint_state(joint_state).result(timeout=self._timeout)
 
     def get_observations(self) -> Dict[str, np.ndarray]:
-        return self._client.get_observations().result()
+        self._connected()
+        return self._client.get_observations().result(timeout=self._timeout)
+
+    def reconnect(self) -> None:
+        """Drop the socket and dial again, on a fresh Client.
+
+        A timed-out request stays in ``Client.futures`` (only the receive path pops it), so a
+        connection that has stopped answering never recovers on its own. ``close`` fails every
+        pending future and clears that dict, so the replacement starts clean."""
+        try:
+            self.close()
+        except Exception as e:  # a wedged socket must not stop us from dialing again
+            logging.warning(f"[{self._addr}] closing the stale client failed: {e}")
+        self._client = portal.Client(self._addr)
 
     def close(self) -> None:
         """Tear down the underlying portal client (background loop thread + socket)."""
-        self._client.close()
+        self._client.close(timeout=1.0)
 
     def __enter__(self) -> "ClientRobot":
         return self
@@ -147,10 +198,15 @@ def _yam_polling_worker(
     cmd_queue: Any,
     stop_event: Any,
     rate_name: str,
+    enable_auto_recovery: bool = False,
 ) -> None:
     """Owns the YAM hardware. Streams joint_pos into ``pos_shared`` at hardware
     rate; if ``cmd_queue`` is provided, drains pending commands onto the YAM.
-    Publishes the actual DOF count via ``n_dofs_value`` once the YAM is up."""
+    Publishes the actual DOF count via ``n_dofs_value`` once the YAM is up.
+
+    ``enable_auto_recovery`` is forwarded to the motor chain: with it off, one motor error
+    kills the chain's control loop thread while this process keeps serving stale cached
+    state (see run_follower)."""
     override_log_level()
     arm_type = ArmType.from_string_name(args.arm)
     gripper_type = GripperType.from_string_name(args.gripper)
@@ -161,6 +217,7 @@ def _yam_polling_worker(
         gripper_type=gripper_type,
         ee_mass=args.ee_mass,
         sim=args.sim,
+        enable_auto_recovery=enable_auto_recovery,
     )
     n_dofs_value.value = yam.num_dofs()
     rate = RateRecorder(name=rate_name, report_interval=1.0)
@@ -405,6 +462,7 @@ def _run_leader_io_loop(
     control worker onto the follower over RPC, and pull the follower's latest
     joint_pos into ``pos_shared`` so the worker can read it for bilateral
     feedback."""
+    consecutive_errors = 0
     while not stop_event.is_set():
         # Drain to the newest command and drop any stale backlog: the control worker can enqueue
         # faster than each blocking RPC round-trip drains, so replaying every queued command would
@@ -421,12 +479,23 @@ def _run_leader_io_loop(
             pos = client_robot.get_joint_pos()
             pos_shared.array[: len(pos)] = pos
             io_rate.track()
+            consecutive_errors = 0
         except Exception as e:
             # Ride out a transient follower/network blip. Without this the exception escapes to
             # run_leader, whose finally: cleanup() calls proc.kill() on the control worker while the
             # leader arm is energized in bilateral PD — an abrupt loss of control of a powered arm.
-            logging.error(f"[yam-leader web-port io] error: {e}")
+            consecutive_errors += 1
+            logging.error(f"[yam-leader web-port io] error ({consecutive_errors} in a row): {e}")
+            if consecutive_errors >= _RPC_ERRORS_BEFORE_RECONNECT:
+                # Not a blip: this connection has stopped answering, and it will not resume.
+                logging.error("[yam-leader web-port io] follower unresponsive, reconnecting")
+                client_robot.reconnect()
+                consecutive_errors = 0
             time.sleep(0.1)
+        # Pace the loop. Unpaced it ran ~9.5 kHz, i.e. ~19k RPC/s at a follower server with a
+        # single worker thread — 20x more than the ~410 Hz control worker produces setpoints at,
+        # and enough pressure on portal's flow control that one stall wedged it for good.
+        time.sleep(_WORKER_LOOP_PERIOD_S)
 
 
 def _run_viewer_loop(
@@ -529,6 +598,12 @@ def run_follower(args: Args) -> None:
             cmd_queue,
             resources.stop_event,
             "follower yam-hardware",
+            # A follower error must not fail fast: the CAN frames only ever leave the motor
+            # chain's own control-loop thread, and that thread dies on the first motor error
+            # -- silently, since this process keeps serving the last cached joint_pos over RPC
+            # and accepting commands nobody sends. The arm then holds its last MIT setpoint and
+            # freezes mid-teleop. Let the chain clean+re-enable errored motors instead.
+            True,  # enable_auto_recovery
             name="follower-yam-control",
         )
     )
@@ -550,7 +625,20 @@ def run_follower(args: Args) -> None:
 
 def run_leader(args: Args) -> None:
     client_robot = ClientRobot(args.server_port, host=args.server_host)
-    initial_follower_pos = client_robot.get_joint_pos()
+    # Retry: the RPCs are timeout-bounded now, and the follower may still be calibrating its
+    # gripper when the leader starts, which takes longer than one timeout.
+    deadline = time.time() + _FOLLOWER_STARTUP_TIMEOUT_S
+    while True:
+        try:
+            initial_follower_pos = client_robot.get_joint_pos()
+            break
+        except TimeoutError:
+            if time.time() > deadline:
+                raise TimeoutError(
+                    f"follower on {args.server_host}:{args.server_port} did not answer within "
+                    f"{_FOLLOWER_STARTUP_TIMEOUT_S:.0f}s"
+                ) from None
+            logging.info("waiting for the follower to answer...")
     logging.info(f"Initial follower joint pos: {initial_follower_pos}")
 
     resources = Resources(

@@ -29,6 +29,12 @@ engaged_* arrays record which one you got. EEF poses are the FK of the arm's ter
 ``gripper`` mount body in each arm's own base frame (quat wxyz); action_eef_delta is the
 commanded pose relative to the measured pose (base-frame dpos + base-frame axis-angle drot).
 
+CAN buses are kernel-default names, assigned to arms by scripts/can_map.conf -- the one
+mapping table, edited by hand when a reboot or replug moves the numbering. No udev persistent
+names and no auto-resolution. Each adapter's un-cabled sibling netdev must stay DOWN --
+sudo scripts/fix_can_links.sh puts every adapter in that state, and startup refuses to launch
+if a sibling is UP (it would steal motor replies).
+
 Usage:
     python scripts/bimanual_teleop_record.py --task pick_place
     python scripts/bimanual_teleop_record.py --sim --task smoke     # follower-only MuJoCo smoke test
@@ -64,6 +70,7 @@ _REPO_ROOT = _SCRIPTS_DIR.parent
 sys.path.insert(0, str(_SCRIPTS_DIR))
 
 import realsense_multicam as rsm
+from can_channels import channel_for
 
 _MINIMUM_GELLO = _REPO_ROOT / "examples" / "minimum_gello" / "minimum_gello.py"
 _CAMERA_ROLES = ("top", "left_wrist", "right_wrist")
@@ -72,11 +79,26 @@ _ENGAGED_MAX_CMD_AGE_S = 0.3
 _INPUT_DEBOUNCE_S = 0.3
 _CAM_FRESH_S = 0.5
 """All cameras must have delivered a frame this recently for an episode to start."""
+_RPC_TIMEOUT_S = 2.0
+"""Per-RPC deadline. Normal calls take milliseconds; without a deadline a wedged follower
+server blocks the tick loop forever (portal futures wait unbounded by default)."""
+_CLEANUP_STEP_TIMEOUT_S = 5.0
+"""Every teardown step is given this long, then abandoned. Nothing on the way out may hang:
+the step that matters (killing the gello processes, which drive the arms) is the last one."""
+
+_LIBC = None
+try:
+    import ctypes
+
+    _LIBC = ctypes.CDLL("libc.so.6", use_errno=True)
+except OSError:  # pragma: no cover -- non-glibc; the pdeathsig safety net is then skipped
+    _LIBC = None
 
 
 @dataclass
 class Args:
-    task: str = "default_task"
+    # task: str = "default_task"
+    task: str = "box_folding"
     """Task name; episodes land in <save_root>/<task>/episode_NNNN."""
     save_root: str = "~/yam_data"
 
@@ -84,10 +106,16 @@ class Args:
     arm: str = "yam"
     version: int = 1
     follower_gripper: str = "linear_4310"
-    can_follower_left: str = "can_f_white_l"
-    can_follower_right: str = "can_f_white_r"
-    can_leader_left: str = "can_leader_l"
-    can_leader_right: str = "can_leader_r"
+    can_follower_left: str = channel_for("follower_left")
+    """LEFT follower CAN netdev. Default comes from the mapping table scripts/can_map.conf."""
+    can_follower_right: str = channel_for("follower_right")
+    """RIGHT follower CAN netdev (from scripts/can_map.conf)."""
+    can_leader_left: str = channel_for("leader_left")
+    """LEFT leader CAN netdev (from scripts/can_map.conf)."""
+    can_leader_right: str = channel_for("leader_right")
+    """RIGHT leader CAN netdev (from scripts/can_map.conf). No udev persistent names and no
+    serial-based auto-resolution any more: both kept binding to the wrong (un-cabled) channel
+    of the dual-channel adapters."""
     port_left: int = 1235
     port_right: int = 1234
     bilateral_kp: float = 0.0
@@ -107,6 +135,14 @@ class Args:
     cam_width: int = 640
     cam_height: int = 480
     cam_fps: int = 30
+    """Color geometry for the wrist cameras."""
+    top_width: int = 1920
+    top_height: int = 1080
+    top_fps: int = 30
+    """Color geometry for the D435 third-person camera -- its full 1080p mode. Both this and
+    the wrist geometry are upper bounds: a camera opens at the closest profile it advertises,
+    never a larger one. 1080p is ~6x the wire cost of 640x480, so give the D435 a USB3 port
+    that it does not share with the wrist cams, or it will starve (watch for the [bw] warning)."""
     allow_missing_cameras: bool = False
     """Keep going with fewer than three cameras (always allowed under --sim)."""
 
@@ -141,6 +177,52 @@ class Speaker:
             except Exception as e:
                 logging.warning(f"spd-say failed: {e}")
                 self._cmd = None
+
+
+class ShutdownRequest:
+    """Ctrl-C handling: first signal asks for a clean stop, second one forces the exit.
+
+    Why not plain KeyboardInterrupt: it lands at an arbitrary bytecode, including in the
+    middle of teardown, where it used to abort the cleanup *before* the gello processes were
+    killed -- leaving them (and the arms they drive) running with no parent. Here the first
+    SIGINT/SIGTERM/SIGHUP only sets a flag that the tick loop and the blocking startup waits
+    poll, so shutdown always runs to the end.
+
+    A second signal means the graceful path is stuck: signal the gello groups directly,
+    give them a moment, kill the survivors and leave via os._exit -- deliberately skipping
+    the atexit/finally machinery, since that is what would be hanging."""
+
+    def __init__(self, procs: List["subprocess.Popen[bytes]"]):
+        self._procs = procs
+        self.requested = threading.Event()
+        self._hits = 0
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, self._on_signal)
+
+    def _on_signal(self, signum: int, frame: Any) -> None:
+        self._hits += 1
+        name = signal.Signals(signum).name
+        if self._hits == 1:
+            print(f"\n[exit] {name} -- shutting down (press Ctrl-C again to force)", flush=True)
+            self.requested.set()
+            return
+        print(f"\n[exit] {name} again -- forcing: stopping the gello processes now", flush=True)
+        for proc in self._procs:
+            _signal_group(proc, signal.SIGINT)  # gives each one a chance to disable its motors
+        deadline = time.monotonic() + 3.0
+        for proc in self._procs:
+            try:
+                proc.wait(timeout=max(0.1, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                pass
+        for proc in self._procs:
+            _signal_group(proc, signal.SIGKILL)
+        os._exit(130)
+
+    def raise_if_requested(self) -> None:
+        """Abort a blocking startup wait. Raises where main() already expects an interrupt."""
+        if self.requested.is_set():
+            raise KeyboardInterrupt
 
 
 class OperatorInput:
@@ -233,19 +315,22 @@ class FollowerClient:
     def __init__(self, name: str, port: int):
         self.name = name
         self._client = portal.Client(f"127.0.0.1:{port}")
-        self.num_dofs: int = int(self._client.num_dofs().result())
+        self.num_dofs: int = int(self._client.num_dofs().result(timeout=10.0))
 
     def read(self) -> Tuple[np.ndarray, np.ndarray, bool]:
         """Returns (measured joint pos, action, engaged). The action is the leader's last
         command when it is fresh, else the measured pos (arm disengaged / never engaged)."""
-        pos = np.asarray(self._client.get_joint_pos().result(), dtype=np.float64)
-        cmd = self._client.get_last_command().result()
+        pos = np.asarray(self._client.get_joint_pos().result(timeout=_RPC_TIMEOUT_S), dtype=np.float64)
+        cmd = self._client.get_last_command().result(timeout=_RPC_TIMEOUT_S)
         cmd_pos = np.asarray(cmd["pos"], dtype=np.float64)
         engaged = cmd_pos.shape == pos.shape and (time.time() - float(cmd["time"])) < _ENGAGED_MAX_CMD_AGE_S
         return pos, (cmd_pos if engaged else pos.copy()), engaged
 
     def close(self) -> None:
-        self._client.close()
+        # portal's default close() joins its socket thread with no timeout: if that thread is
+        # wedged (server gone mid-call, unflushed send queue) the join never returns and the
+        # whole teardown stops here, before the gello processes get killed.
+        self._client.close(timeout=2.0)
 
 
 class CameraRig:
@@ -340,6 +425,17 @@ def _assign_camera_roles(cams: List[Dict], args: Args) -> Dict[str, Dict]:
     return {role: roles[role] for role in _CAMERA_ROLES if role in roles}
 
 
+def _rsm_args_for_role(args: Args, role: str) -> rsm.Args:
+    """Color-only stream request for one camera role: the top cam gets its own geometry,
+    every wrist cam shares the ``cam_*`` one."""
+    w, h, fps = (
+        (args.top_width, args.top_height, args.top_fps)
+        if role == "top"
+        else (args.cam_width, args.cam_height, args.cam_fps)
+    )
+    return rsm.Args(width=w, height=h, fps=fps, depth=False, color=True, align=False)
+
+
 def _open_camera_rig(args: Args) -> CameraRig:
     try:
         cams = rsm.discover(None)
@@ -350,13 +446,14 @@ def _open_camera_rig(args: Args) -> CameraRig:
         raise RuntimeError("no RealSense cameras found (check `lsusb | grep 8086` and cables)")
     roles = _assign_camera_roles(cams, args) if cams else {}
     if roles:
-        rsm_args = rsm.Args(
-            width=args.cam_width, height=args.cam_height, fps=args.cam_fps, depth=False, color=True, align=False
-        )
         cam_list = list(roles.values())
-        rsm.resolve(cam_list, rsm_args)
+        # Profiles are negotiated per role -- the top cam runs at a different geometry from the
+        # wrists -- so resolve() is called one camera at a time. open_pipelines() reads only
+        # `align` off its Args, the geometry it opens comes from what resolve() stored per camera.
+        for role, cam in roles.items():
+            rsm.resolve([cam], _rsm_args_for_role(args, role))
         rsm.report_bandwidth_estimate(cam_list)
-        rsm.open_pipelines(cam_list, rsm_args)
+        rsm.open_pipelines(cam_list, _rsm_args_for_role(args, "top"))
         for cam in cam_list:
             cam["last_arrival"] = 0.0
     rig = CameraRig(roles)
@@ -488,17 +585,69 @@ def _next_episode_index(task_dir: Path) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _adapter_serial(channel: str) -> Optional[str]:
+    """USB serial of the adapter behind a CAN netdev (None for non-USB / missing).
+
+    Only used to tell which two netdevs sit on the same physical adapter -- arm identity comes
+    from the fixed channel mapping, not from serials."""
+    try:
+        dev = (Path("/sys/class/net") / channel / "device").resolve()
+        return (dev.parent / "serial").read_text().strip()
+    except OSError:
+        return None
+
+
+def _sibling_channels(channel: str) -> List[str]:
+    """The other CAN netdev(s) of the same dual-channel adapter."""
+    mine = _adapter_serial(channel)
+    if mine is None:
+        return []
+    others = (p.name for p in sorted(Path("/sys/class/net").glob("can*")) if p.name != channel)
+    return [name for name in others if _adapter_serial(name) == mine]
+
+
+def _channel_is_up(channel: str) -> bool:
+    try:
+        flags = int((Path("/sys/class/net") / channel / "flags").read_text().strip(), 16)
+        return bool(flags & 1)  # IFF_UP
+    except (OSError, ValueError):
+        return False
+
+
 def _check_can_interface(interface: str) -> None:
     result = subprocess.run(["ip", "link", "show", interface], capture_output=True, text=True, check=False)
     if result.returncode != 0:
-        raise RuntimeError(f"CAN interface {interface} not found")
+        raise RuntimeError(
+            f"CAN interface {interface} not found -- the arm/channel mapping is fixed "
+            f"(scripts/can_channels.py); run scripts/reset_all_can.sh"
+        )
     if "state UP" not in result.stdout and "state UNKNOWN" not in result.stdout:
         raise RuntimeError(f"CAN interface {interface} exists but is not UP (try scripts/reset_all_can.sh)")
+    # The un-cabled sibling channel of the same adapter must stay DOWN: while it is UP it
+    # absorbs part of the motors' replies and the control loop sees motors drop out at random.
+    up_siblings = [s for s in _sibling_channels(interface) if _channel_is_up(s)]
+    if up_siblings:
+        raise RuntimeError(
+            f"{interface}: sibling channel(s) {up_siblings} of the same adapter are UP and will "
+            f"steal motor replies -- run sudo scripts/fix_can_links.sh"
+        )
 
 
-def _wait_for_port(port: int, timeout_s: float = 90.0) -> None:
+def _wait_for_port(
+    port: int,
+    timeout_s: float = 90.0,
+    proc: Optional["subprocess.Popen[bytes]"] = None,
+    shutdown: Optional[ShutdownRequest] = None,
+) -> None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
+        if shutdown is not None:
+            shutdown.raise_if_requested()  # Ctrl-C during startup must not wait out the timeout
+        if proc is not None and proc.poll() is not None:
+            raise RuntimeError(
+                f"follower for port {port} exited with code {proc.returncode} before serving -- "
+                "usually a dead CAN bus; run scripts/check_arms.py"
+            )
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=1.0):
                 return
@@ -507,17 +656,36 @@ def _wait_for_port(port: int, timeout_s: float = 90.0) -> None:
     raise TimeoutError(f"follower server on port {port} did not come up within {timeout_s:.0f}s")
 
 
+def _child_pdeathsig() -> None:
+    """Run in the child between fork and exec: ask the kernel to SIGINT it when the recorder
+    dies. Without this, anything that kills the recorder outright (SIGKILL, terminal hangup,
+    a crash) leaves the gello processes -- and the arms they drive -- running unparented.
+
+    preexec_fn is only safe in a single-threaded parent; gello processes are spawned before
+    any camera/input/RPC thread starts, and libc is already loaded, so no work happens here
+    beyond one syscall."""
+    if _LIBC is not None:
+        _LIBC.prctl(1, signal.SIGINT)  # PR_SET_PDEATHSIG
+
+
 def _spawn_gello(cmd_args: List[str]) -> "subprocess.Popen[bytes]":
     cmd = [sys.executable, str(_MINIMUM_GELLO), *cmd_args]
     print(f"[launch] {' '.join(cmd)}")
     # Own session (= own process group) per gello process: teardown signals the whole group,
     # reaching the portal worker children that actually own the CAN hardware, and a terminal
     # Ctrl-C on the recorder no longer double-delivers SIGINT to them directly.
-    return subprocess.Popen(cmd, start_new_session=True)
+    # preexec_fn is flagged as unsafe with threads; it is suppressed below because gello
+    # processes are spawned before this process starts any thread (see _child_pdeathsig).
+    return subprocess.Popen(cmd, start_new_session=True, preexec_fn=_child_pdeathsig)  # noqa: PLW1509
 
 
-def _launch_gello_processes(args: Args) -> List["subprocess.Popen[bytes]"]:
-    """Followers first (they serve RPC), then leaders once both servers accept connections."""
+def _launch_gello_processes(
+    args: Args, procs: List["subprocess.Popen[bytes]"], shutdown: Optional[ShutdownRequest] = None
+) -> None:
+    """Followers first (they serve RPC), then leaders once both servers accept connections.
+
+    Spawned processes are appended to ``procs`` (owned by the caller) as they start, so the
+    caller's cleanup can reach them even when this function is interrupted mid-launch."""
     if not args.sim:
         for interface in (
             args.can_follower_left,
@@ -526,20 +694,28 @@ def _launch_gello_processes(args: Args) -> List["subprocess.Popen[bytes]"]:
             args.can_leader_right,
         ):
             _check_can_interface(interface)
+        print(
+            "[can] follower-left "
+            f"{args.can_follower_left}, follower-right {args.can_follower_right}, "
+            f"leader-left {args.can_leader_left}, leader-right {args.can_leader_right} (scripts/can_map.conf)"
+        )
         print("[launch] all CAN interfaces up")
 
     common = ["--arm", args.arm, "--version", str(args.version)]
-    procs: List[subprocess.Popen[bytes]] = []
     followers = [(args.can_follower_right, args.port_right), (args.can_follower_left, args.port_left)]
+    follower_procs: Dict[int, subprocess.Popen[bytes]] = {}
     for can, port in followers:
         cmd = [*common, "--can_channel", can, "--gripper", args.follower_gripper, "--server_port", str(port)]
         if args.sim:
             cmd.append("--sim")
-        procs.append(_spawn_gello(cmd))
+        follower_procs[port] = _spawn_gello(cmd)
+        procs.append(follower_procs[port])
     for _, port in followers:
-        _wait_for_port(port)
+        _wait_for_port(port, proc=follower_procs[port], shutdown=shutdown)
     print("[launch] follower servers up")
 
+    if shutdown is not None:
+        shutdown.raise_if_requested()
     if not args.sim:
         leaders = [(args.can_leader_right, args.port_right), (args.can_leader_left, args.port_left)]
         for can, port in leaders:
@@ -560,7 +736,6 @@ def _launch_gello_processes(args: Args) -> List["subprocess.Popen[bytes]"]:
                     ]
                 )
             )
-    return procs
 
 
 def _signal_group(proc: "subprocess.Popen[bytes]", sig: int) -> None:
@@ -589,7 +764,33 @@ def _terminate(procs: List["subprocess.Popen[bytes]"]) -> None:
     for proc in procs:
         _signal_group(proc, signal.SIGKILL)
         if proc.poll() is None:
-            proc.wait()
+            try:
+                proc.wait(timeout=2.0)  # bounded: a process wedged in the kernel must not hang us
+            except subprocess.TimeoutExpired:
+                logging.warning(f"process {proc.pid} survived SIGKILL (stuck in a driver call?)")
+
+
+def _cleanup_step(name: str, fn: Any, timeout: float = _CLEANUP_STEP_TIMEOUT_S) -> None:
+    """Run one teardown step, abandoning it if it hangs.
+
+    Each step calls into a library that can block indefinitely on a bad day (pynput's X11
+    listener, librealsense's pipeline.stop, portal's socket thread). None of them is allowed
+    to stop the steps that come after -- killing the gello processes is the one that matters."""
+    error: List[BaseException] = []
+
+    def run() -> None:
+        try:
+            fn()
+        except BaseException as e:  # teardown reports, never propagates
+            error.append(e)
+
+    thread = threading.Thread(target=run, name=f"cleanup-{name}", daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        logging.warning(f"[exit] {name} did not finish within {timeout:.0f}s -- moving on without it")
+    elif error:
+        logging.warning(f"[exit] {name} failed: {error[0]}")
 
 
 # ---------------------------------------------------------------------------
@@ -696,12 +897,16 @@ def main(args: Args) -> None:
     dt = 1.0 / args.fps
     window = "bimanual teleop"
 
+    # Installed before anything is launched, so a Ctrl-C during startup is handled the same
+    # way as one during recording -- and so it can already reach the processes in ``procs``.
+    shutdown = ShutdownRequest(procs)
+
     try:
         if args.launch:
-            procs = _launch_gello_processes(args)
+            _launch_gello_processes(args, procs, shutdown)
         else:
             for port in (args.port_right, args.port_left):
-                _wait_for_port(port, timeout_s=10.0)
+                _wait_for_port(port, timeout_s=10.0, shutdown=shutdown)
 
         clients = {"left": FollowerClient("left", args.port_left), "right": FollowerClient("right", args.port_right)}
         print(f"[robot] followers up: left {clients['left'].num_dofs} dofs, right {clients['right'].num_dofs} dofs")
@@ -714,6 +919,11 @@ def main(args: Args) -> None:
             "arm": args.arm,
             "version": args.version,
             "cameras": {role: cam["serial"] for role, cam in rig.cams_by_role.items()},
+            # The roles no longer share one geometry, so record what each actually negotiated.
+            "camera_color_profiles": {
+                role: (f"{cam['color'][0]}x{cam['color'][1]}@{cam['color'][2]}" if cam.get("color") else None)
+                for role, cam in rig.cams_by_role.items()
+            },
             "arms": {
                 "left": {"follower_can": args.can_follower_left, "leader_can": args.can_leader_left},
                 "right": {"follower_can": args.can_follower_right, "leader_can": args.can_leader_right},
@@ -741,6 +951,12 @@ def main(args: Args) -> None:
 
         while True:
             tick_start = time.monotonic()
+            if shutdown.requested.is_set():
+                if writer is not None:
+                    writer.discard()
+                    writer = None
+                    speaker.say("interrupted, episode discarded")
+                break
             event = inputs.pop()
 
             if event == OperatorInput.QUIT:
@@ -820,17 +1036,24 @@ def main(args: Args) -> None:
             writer = None
             speaker.say("interrupted, episode discarded")
     finally:
+        # Every step is bounded and independent: the run must always reach _terminate, which
+        # is what stops the arms. Ctrl-C during this stretch escalates via ShutdownRequest.
+        print("[exit] stopping...", flush=True)
         if inputs is not None:
-            inputs.close()
+            _cleanup_step("input listeners", inputs.close)
         if args.display:
-            cv2.destroyAllWindows()
-        if rig is not None:
-            rig.stop()
-        for client in clients.values():
+            # In the main thread: the window was created here, and GUI backends dislike being
+            # torn down from another one.
             try:
-                client.close()
-            except Exception:
-                pass
+                cv2.destroyAllWindows()
+            except Exception as e:
+                logging.warning(f"[exit] preview window: {e}")
+        if rig is not None:
+            _cleanup_step("cameras", rig.stop)
+        for client in clients.values():
+            _cleanup_step(f"{client.name} follower client", client.close)
+        # Last and in the main thread: _terminate is bounded by construction, and this is the
+        # step that must actually happen -- it is what stops the arms.
         _terminate(procs)
         n = len(state.saved_this_session)
         print(f"[exit] {n} episode(s) saved this session -> {task_dir}")
