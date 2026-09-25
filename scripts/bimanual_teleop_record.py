@@ -7,16 +7,29 @@ discard, reset and continue without touching the terminal.
 
 Controls (global via pynput on X11, plus the preview window when focused):
     Space / n / mouse LEFT   IDLE -> start recording;  RECORDING -> stop and SAVE
+    f                        RECORDING -> stop and SAVE as a FAILED trajectory (episode_NNNN_failed)
     r / d / mouse RIGHT      RECORDING -> stop and DISCARD;  IDLE -> retract last saved episode
-    q / Esc                  quit the session (a recording in progress is discarded)
+    q / Esc                  quit the session (a recording in progress is discarded; both arms
+                             then open their grippers and fold down to the home rest pose
+                             before the gello processes are killed)
+
+On the way out the recorder parks the arms itself: grippers open, then one arm at a time
+back to the folded home pose, and only then are the gello processes killed (killing them cuts
+motor torque, and home is where an unpowered arm rests, so it settles there instead of dropping
+from wherever teleop left it). The park is made over the follower RPC ports, so it needs the
+leaders released -- an engaged leader owns its follower and the two command streams would fight.
+If a leader is still engaged the recorder says so over TTS and waits, repeating the prompt, until
+the handle is released (or --disengage-wait-s runs out, after which it skips the park).
 
 Tip: put the wireless mouse on the floor and press it with your foot -- left click saves,
 right click discards. Every state change is announced through TTS (spd-say), so you never
 need to look at the screen. Engage/disengage teleop itself stays on the leader handle button.
 
 Data layout (one directory per episode; discard = move to discarded/, videos only --
-low_dim.npz and meta.json are written at save time):
-    <save_root>/<task>/episode_0000/
+low_dim.npz and meta.json are written at save time). A failed trajectory (``f``) is a normal
+save whose directory carries a ``_failed`` suffix and whose meta.json has ``failed: true``;
+it still consumes an episode index, so numbering is unaffected:
+    <save_root>/<task>/episode_0000/          # (or episode_0000_failed/)
         top.mp4  left_wrist.mp4  right_wrist.mp4   # color streams, one frame per tick
         low_dim.npz   # per side: joint_pos, eef_pos/quat, gripper (state); action_joint_pos,
                       # action_eef_pos/quat, action_eef_delta, action_gripper (action);
@@ -74,6 +87,9 @@ from can_channels import channel_for
 
 _MINIMUM_GELLO = _REPO_ROOT / "examples" / "minimum_gello" / "minimum_gello.py"
 _CAMERA_ROLES = ("top", "left_wrist", "right_wrist")
+_DISPLAY_MAX_ROW_ASPECT = 0.55
+"""Upper bound on the preview camera row's height, as a fraction of --display-width, so the
+window stays shorter than a 1080p screen even when only one camera is present."""
 _ENGAGED_MAX_CMD_AGE_S = 0.3
 """A command younger than this means the leader is engaged and streaming."""
 _INPUT_DEBOUNCE_S = 0.3
@@ -85,6 +101,22 @@ server blocks the tick loop forever (portal futures wait unbounded by default)."
 _CLEANUP_STEP_TIMEOUT_S = 5.0
 """Every teardown step is given this long, then abandoned. Nothing on the way out may hang:
 the step that matters (killing the gello processes, which drive the arms) is the last one."""
+_HOME_Q = np.array([0.0, 0.02, 0.07, -0.13, 0.0, 0.0])
+"""Folded rest pose, 6 arm joints: where the arm sits with its motors off (same pose as
+box_packing/poses.py HOME_Q). Parking here means killing the gello processes drops the arm by
+millimetres instead of from wherever teleop left it."""
+_GRIPPER_OPEN = 1.0
+"""Normalized gripper command for fully open -- released before the arm moves, so nothing stays
+clamped when torque goes away."""
+_PARK_SEND_HZ = 50.0
+"""Command rate of the park slew. The follower holds the last command, so this only has to be
+fast enough for the ramp to look continuous."""
+_PARK_SETTLE_S = 0.5
+"""Wait after each park ramp, so the arm reaches the command before the next step."""
+_DISENGAGE_PROMPT_S = 5.0
+"""How often the 'stop teleop' prompt is repeated while a leader is still engaged."""
+_PARK_ENGAGED_CHECK_S = 0.3
+"""How often the park slew re-checks that no leader has grabbed its follower back."""
 
 _LIBC = None
 try:
@@ -123,6 +155,19 @@ class Args:
     """Spawn the four minimum_gello processes. --no-launch attaches to already-running ones."""
     sim: bool = False
     """Followers run in MuJoCo, leaders are not launched. For testing without hardware."""
+
+    # --- exit park ---
+    park_on_exit: bool = True
+    """On q (and on Ctrl-C), open both grippers and fold both arms down to the home rest pose
+    before the gello processes are killed. --no-park-on-exit leaves the arms where they are."""
+    park_joint_vel: float = 0.6
+    """Joint slew limit (rad/s) of the park move. Only this move; teleop is unaffected."""
+    park_gripper_vel: float = 1.0
+    """Slew limit (normalized units/s) of the gripper release that precedes the park move."""
+    disengage_wait_s: float = 180.0
+    """How long to keep asking for the leader handle to be released before giving up on the
+    park. A park move and an engaged leader are two command streams for one follower, so the
+    park never starts underneath an engaged leader. A second Ctrl-C forces the exit anyway."""
 
     # --- cameras ---
     top_serial: Optional[str] = None
@@ -232,6 +277,7 @@ class OperatorInput:
     collapse into one event; duplicate presses are therefore idempotent."""
 
     TOGGLE = "toggle"
+    SAVE_FAILED = "save_failed"
     DISCARD = "discard"
     QUIT = "quit"
 
@@ -288,6 +334,8 @@ class OperatorInput:
         """Feed a key from any source (pynput chars and cv2.waitKey both land here)."""
         if char in ("n", " "):
             self._push(self.TOGGLE)
+        elif char == "f":
+            self._push(self.SAVE_FAILED)
         elif char in ("r", "d"):
             self._push(self.DISCARD)
         elif char in ("q", "\x1b"):
@@ -310,12 +358,14 @@ class OperatorInput:
 
 
 class FollowerClient:
-    """Thin RPC reader for one follower server: measured pos + last leader command."""
+    """Thin RPC client for one follower server: measured pos + last leader command, plus the
+    position commands the exit park is made of (teleop itself is commanded by the leader)."""
 
     def __init__(self, name: str, port: int):
         self.name = name
         self._client = portal.Client(f"127.0.0.1:{port}")
         self.num_dofs: int = int(self._client.num_dofs().result(timeout=10.0))
+        self._last_sent: Optional[np.ndarray] = None
 
     def read(self) -> Tuple[np.ndarray, np.ndarray, bool]:
         """Returns (measured joint pos, action, engaged). The action is the leader's last
@@ -323,8 +373,27 @@ class FollowerClient:
         pos = np.asarray(self._client.get_joint_pos().result(timeout=_RPC_TIMEOUT_S), dtype=np.float64)
         cmd = self._client.get_last_command().result(timeout=_RPC_TIMEOUT_S)
         cmd_pos = np.asarray(cmd["pos"], dtype=np.float64)
-        engaged = cmd_pos.shape == pos.shape and (time.time() - float(cmd["time"])) < _ENGAGED_MAX_CMD_AGE_S
+        fresh = cmd_pos.shape == pos.shape and (time.time() - float(cmd["time"])) < _ENGAGED_MAX_CMD_AGE_S
+        engaged = fresh and not self._is_own(cmd_pos)
         return pos, (cmd_pos if engaged else pos.copy()), engaged
+
+    def _is_own(self, cmd_pos: np.ndarray) -> bool:
+        """The server remembers *every* command it gets, ours included: during the exit park
+        the freshest one is the ramp's own, which must not read as an engaged leader."""
+        return (
+            self._last_sent is not None
+            and cmd_pos.shape == self._last_sent.shape
+            and bool(np.array_equal(cmd_pos, self._last_sent))
+        )
+
+    def command(self, joint_pos: np.ndarray) -> None:
+        """Absolute joint-position command (arm joints + normalized gripper). Only the exit
+        park uses this -- during teleop the leader is the one commanding the follower."""
+        q = np.asarray(joint_pos, dtype=np.float64)
+        self._client.command_joint_pos(q).result(timeout=_RPC_TIMEOUT_S)
+        # After the RPC returns: the server has already remembered it, so a leader command
+        # arriving between the two is still seen as foreign by the next read().
+        self._last_sent = q
 
     def close(self) -> None:
         # portal's default close() joins its socket thread with no timeout: if that thread is
@@ -355,24 +424,47 @@ class CameraRig:
                 if frames:
                     cam["last"] = frames
                     cam["last_arrival"] = time.monotonic()
+                    cam["frames"] = cam.get("frames", 0) + 1
             time.sleep(0.002)
 
     def snapshot(self) -> Dict[str, Tuple[np.ndarray, float]]:
         """Latest color image (BGR copy) and device timestamp (ms) per role that has a frame."""
         out: Dict[str, Tuple[np.ndarray, float]] = {}
-        for role, cam in self.cams_by_role.items():
-            frames = cam["last"]
-            if frames is None:
-                continue
-            color = frames.get_color_frame()
-            if not color:
-                continue
-            out[role] = (np.asanyarray(color.get_data()).copy(), float(frames.get_timestamp()))
+        for role in self.cams_by_role:
+            frame = self.snapshot_role(role)
+            if frame is not None:
+                out[role] = frame
         return out
+
+    def snapshot_role(
+        self, role: str, *, after_timestamp: Optional[float] = None
+    ) -> Optional[Tuple[np.ndarray, float]]:
+        """Copy the latest color frame for one role, optionally only when it is new.
+
+        The timestamp check happens before copying the pixels. This lets a high-rate recorder
+        poll independently of a slower control loop without repeatedly copying a 1080p frame.
+        """
+        cam = self.cams_by_role.get(role)
+        if cam is None:
+            return None
+        frames = cam["last"]
+        if frames is None:
+            return None
+        timestamp = float(frames.get_timestamp())
+        if after_timestamp is not None and timestamp == after_timestamp:
+            return None
+        color = frames.get_color_frame()
+        if not color:
+            return None
+        return np.asanyarray(color.get_data()).copy(), timestamp
 
     def all_fresh(self, max_age_s: float = _CAM_FRESH_S) -> bool:
         now = time.monotonic()
         return all(now - cam.get("last_arrival", 0.0) < max_age_s for cam in self.cams_by_role.values())
+
+    def frame_counts(self) -> Dict[str, int]:
+        """Number of frames delivered to the poll loop for each role."""
+        return {role: int(cam.get("frames", 0)) for role, cam in self.cams_by_role.items()}
 
     def stop(self) -> None:
         self._stop.set()
@@ -548,19 +640,35 @@ class EpisodeWriter:
             writer.release()
         self._writers.clear()
 
-    def save(self, meta: Dict[str, Any]) -> Path:
+    def save(self, meta: Dict[str, Any], failed: bool = False) -> Path:
+        """Finalize the episode. ``failed=True`` marks it as a failed trajectory: meta.json gets
+        ``failed: true`` and the directory is renamed with a ``_failed`` suffix."""
         self._release_writers()
         arrays = {k: np.asarray(v) for k, v in self._low.items()}
         for role, ts in self._cam_ts.items():
             arrays[f"cam_t_{role}"] = np.asarray(ts, dtype=np.float64)
         np.savez_compressed(self.ep_dir / "low_dim.npz", **arrays)
-        meta = dict(meta, n_frames=self.n_frames, fps=self.fps, saved_at=datetime.now().isoformat(timespec="seconds"))
+        meta = dict(
+            meta,
+            n_frames=self.n_frames,
+            fps=self.fps,
+            failed=failed,
+            saved_at=datetime.now().isoformat(timespec="seconds"),
+        )
         (self.ep_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+        if failed:
+            failed_dir = self.ep_dir.with_name(f"{self.ep_dir.name}{FAILED_SUFFIX}")
+            self.ep_dir.rename(failed_dir)
+            self.ep_dir = failed_dir
         return self.ep_dir
 
     def discard(self) -> None:
         self._release_writers()
         _retire_episode(self.ep_dir)
+
+
+FAILED_SUFFIX = "_failed"
+"""Directory-name suffix of an episode saved with the ``f`` key (failed trajectory)."""
 
 
 def _retire_episode(ep_dir: Path) -> None:
@@ -794,6 +902,110 @@ def _cleanup_step(name: str, fn: Any, timeout: float = _CLEANUP_STEP_TIMEOUT_S) 
 
 
 # ---------------------------------------------------------------------------
+# Exit park: grippers open, then home
+# ---------------------------------------------------------------------------
+
+
+def _engaged_sides(clients: Dict[str, FollowerClient]) -> List[str]:
+    """Sides whose leader is currently streaming commands. Raises if a follower cannot be read."""
+    return [side for side, client in clients.items() if client.read()[2]]
+
+
+def _wait_disengaged(clients: Dict[str, FollowerClient], speaker: Speaker, timeout_s: float) -> bool:
+    """Block until no leader is streaming commands, or the timeout passes (then False).
+
+    An engaged leader owns its follower: a park move made underneath it is a second command
+    stream for the same arm, and the arm would chase whichever RPC landed last. So this asks
+    the operator -- out loud, since they are looking at the robot and not at the terminal --
+    to let go of the handle and hold still, and repeats the prompt until they do."""
+    deadline = time.monotonic() + timeout_s
+    last_prompt = 0.0
+    while True:
+        try:
+            engaged = _engaged_sides(clients)
+        except Exception as e:
+            logging.warning(f"[park] could not read the leaders ({e})")
+            return False
+        if not engaged:
+            return True
+        now = time.monotonic()
+        if now - last_prompt > _DISENGAGE_PROMPT_S:
+            speaker.say("stop teleop, release the leader handle and hold still")
+            last_prompt = now
+        print(f"[park] leader engaged on {', '.join(engaged)} -- waiting for the handle to be released", flush=True)
+        if now > deadline:
+            return False
+        time.sleep(0.2)
+
+
+def _ramp(client: FollowerClient, q_from: np.ndarray, q_to: np.ndarray, seconds: float) -> None:
+    """Stream a cosine-eased joint-space ramp from ``q_from`` to ``q_to`` at _PARK_SEND_HZ.
+
+    Raises if the side's leader re-engages mid-ramp: the operator grabbing the handle again
+    outranks the park, and two command streams for one follower must never overlap."""
+    dt = 1.0 / _PARK_SEND_HZ
+    seconds = max(seconds, dt)
+    t0 = time.monotonic()
+    last_check = t0
+    while True:
+        now = time.monotonic()
+        s = min(1.0, (now - t0) / seconds)
+        client.command(q_from + (q_to - q_from) * (0.5 - 0.5 * np.cos(np.pi * s)))
+        if now - last_check > _PARK_ENGAGED_CHECK_S:
+            last_check = now
+            if client.read()[2]:
+                raise RuntimeError("leader re-engaged")
+        if s >= 1.0:
+            return
+        time.sleep(dt)
+
+
+def _park_side(client: FollowerClient, args: Args) -> None:
+    """Open one arm's gripper, then fold that arm down to the home rest pose.
+
+    The gripper goes first and on its own: whatever teleop was holding has to be let go before
+    the arm carries it across the table, and the release is a slew of its own so it never snaps
+    open. The ramp starts from the measured position rather than from the leader's last command,
+    so the first command closes the arm's gravity sag instead of re-commanding a pose it was
+    already failing to hold."""
+    start = np.asarray(client.read()[0], dtype=np.float64)
+    n_arm = min(6, client.num_dofs)
+    if client.num_dofs > n_arm:
+        released = start.copy()
+        released[n_arm:] = _GRIPPER_OPEN
+        _ramp(client, start, released, float(np.max(np.abs(released - start))) / args.park_gripper_vel)
+        time.sleep(_PARK_SETTLE_S)
+        start = released
+    home = start.copy()
+    home[:n_arm] = _HOME_Q[:n_arm]
+    _ramp(client, start, home, float(np.max(np.abs(home[:n_arm] - start[:n_arm]))) / args.park_joint_vel)
+    time.sleep(_PARK_SETTLE_S)
+    err = float(np.max(np.abs(np.asarray(client.read()[0])[:n_arm] - home[:n_arm])))
+    print(f"[park] {client.name} at home, worst joint {err:.3f} rad off", flush=True)
+
+
+def _park_arms(clients: Dict[str, FollowerClient], speaker: Speaker, args: Args) -> None:
+    """Release both grippers and fold both arms home, one arm at a time so the two never cross.
+
+    Nothing here raises: the steps that release the hardware come after this one, and an arm
+    left where it was is worse than an exit that never finishes."""
+    if not clients:
+        return
+    if not _wait_disengaged(clients, speaker, args.disengage_wait_s):
+        logging.warning("[park] a leader is still engaged -- leaving the arms where they are")
+        speaker.say("still teleoperating, skipping the park")
+        return
+    speaker.say("opening grippers and going home")
+    for side, client in clients.items():
+        print(f"[park] {side} -> gripper open, home pose", flush=True)
+        try:
+            _park_side(client, args)
+        except Exception as e:
+            logging.warning(f"[park] {side} did not reach home ({type(e).__name__}: {e})")
+            speaker.say(f"{side} arm did not reach home")
+
+
+# ---------------------------------------------------------------------------
 # Display
 # ---------------------------------------------------------------------------
 
@@ -805,6 +1017,72 @@ class SessionState:
     saved_this_session: List[Path] = field(default_factory=list)
     n_frames: int = 0
 
+    @property
+    def n_failed(self) -> int:
+        return sum(p.name.endswith(FAILED_SUFFIX) for p in self.saved_this_session)
+
+
+def _cell(img: np.ndarray, width: int, height: int, label: str = "") -> np.ndarray:
+    """Fit one camera frame into a width x height cell: scaled to fit, centered, padded with
+    black. Letterboxing, never cropping -- the whole frame stays visible whatever its aspect
+    ratio (the top cam is 16:9, the wrists 4:3). The label is drawn after scaling so it stays
+    legible no matter how far the source was downscaled."""
+    scale = min(width / img.shape[1], height / img.shape[0])
+    w, h = max(1, round(img.shape[1] * scale)), max(1, round(img.shape[0] * scale))
+    canvas = np.zeros((height, width, 3), dtype=np.uint8)
+    y, x = (height - h) // 2, (width - w) // 2
+    canvas[y : y + h, x : x + w] = cv2.resize(img, (w, h))
+    if label:
+        cv2.putText(canvas, label, (x + 8, y + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    return canvas
+
+
+def _split(total: int, n: int) -> List[int]:
+    """``n`` integer parts summing to exactly ``total`` (at least 1 each), so tiles laid out
+    side by side always add up to the requested size instead of drifting by a rounding pixel."""
+    edges = [round(i * total / n) for i in range(n + 1)]
+    return [max(1, edges[i + 1] - edges[i]) for i in range(n)]
+
+
+def _build_camera_row(frames: Dict[str, Tuple[np.ndarray, float]], width: int) -> np.ndarray:
+    """Compose the camera tiles into one ``width``-wide image.
+
+    The top view is the one the operator actually steers by, so it gets the whole left side at
+    its full frame while the wrist views stack beside it. The layout solves for the single tile
+    height H that makes ``top_width(H) + wrist_column_width(H / n) == width``, so the row fills
+    the window exactly without any tile being cropped to fit."""
+    tiles = [(role, frames[role][0]) for role in _CAMERA_ROLES if role in frames]
+    if not tiles:
+        return np.zeros((120, width, 3), dtype=np.uint8)
+    top = next((img for role, img in tiles if role == "top"), None)
+    wrists = [(role, img) for role, img in tiles if role != "top"]
+
+    if top is None:
+        # No top cam: fall back to one row of equal-width tiles.
+        widths = _split(width, len(wrists))
+        height = round(min(w * img.shape[0] / img.shape[1] for (_, img), w in zip(wrists, widths, strict=True)))
+        row = np.hstack([_cell(img, w, height, role) for (role, img), w in zip(wrists, widths, strict=True)])
+    elif not wrists:
+        row = _cell(top, width, max(1, round(width * top.shape[0] / top.shape[1])), "top")
+    else:
+        n = len(wrists)
+        a_top = top.shape[1] / top.shape[0]
+        a_wrist = max(img.shape[1] / img.shape[0] for _, img in wrists)
+        height = max(1, round(width / (a_top + a_wrist / n)))
+        top_w = min(width - 1, max(1, round(a_top * height)))
+        heights = _split(height, n)
+        column = np.vstack(
+            [_cell(img, width - top_w, h, role) for (role, img), h in zip(wrists, heights, strict=True)]
+        )
+        row = np.hstack([_cell(top, top_w, column.shape[0], "top"), column])
+
+    cap = round(width * _DISPLAY_MAX_ROW_ASPECT)
+    if row.shape[0] > cap:
+        # A degenerate layout (one 4:3 tile alone) would otherwise make a window taller than the
+        # screen: shrink the row to the cap and center it in the same width.
+        row = _cell(row, width, cap)
+    return row
+
 
 def _build_display(
     frames: Dict[str, Tuple[np.ndarray, float]],
@@ -812,19 +1090,7 @@ def _build_display(
     engaged: Dict[str, bool],
     width: int,
 ) -> np.ndarray:
-    tiles = []
-    for role in _CAMERA_ROLES:
-        if role in frames:
-            tile = frames[role][0].copy()
-            cv2.putText(tile, role, (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            tiles.append(tile)
-    if tiles:
-        height = min(t.shape[0] for t in tiles)
-        row = np.hstack([cv2.resize(t, (round(t.shape[1] * height / t.shape[0]), height)) for t in tiles])
-        if row.shape[1] != width:
-            row = cv2.resize(row, (width, round(row.shape[0] * width / row.shape[1])))
-    else:
-        row = np.zeros((120, width, 3), dtype=np.uint8)
+    row = _build_camera_row(frames, width)
 
     bar = np.zeros((56, width, 3), dtype=np.uint8)
     if state.recording:
@@ -838,7 +1104,8 @@ def _build_display(
     cv2.putText(bar, status, (48, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
     cv2.putText(
         bar,
-        f"engaged [{eng}]  saved {len(state.saved_this_session)}   space/LMB: start-save  r/RMB: discard  q: quit",
+        f"engaged [{eng}]  saved {len(state.saved_this_session)} (failed {state.n_failed})"
+        "   space/LMB: start-save  f: save-failed  r/RMB: discard  q: quit",
         (48, 50),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.5,
@@ -983,6 +1250,19 @@ def main(args: Args) -> None:
                     state.saved_this_session.append(ep_dir)
                     speaker.say(f"saved {state.episode_index}, total {len(state.saved_this_session)}")
                     state.episode_index += 1
+            elif event == OperatorInput.SAVE_FAILED:
+                if writer is not None:
+                    ep_dir = writer.save(meta_base, failed=True)
+                    writer = None
+                    state.recording = False
+                    state.saved_this_session.append(ep_dir)
+                    speaker.say(
+                        f"saved {state.episode_index} as failed, total {len(state.saved_this_session)}, "
+                        f"failed {state.n_failed}"
+                    )
+                    state.episode_index += 1
+                else:
+                    speaker.say("not recording")
             elif event == OperatorInput.DISCARD:
                 if writer is not None:
                     writer.discard()
@@ -1050,13 +1330,19 @@ def main(args: Args) -> None:
                 logging.warning(f"[exit] preview window: {e}")
         if rig is not None:
             _cleanup_step("cameras", rig.stop)
+        # Park before anything is closed and long before _terminate: the gello processes are what
+        # hold the motors, and killing them cuts torque wherever the arms happen to be. Not run
+        # through _cleanup_step -- this one is allowed to take as long as its own ramps and its
+        # disengage wait need, and a second Ctrl-C still forces the exit through ShutdownRequest.
+        if args.park_on_exit:
+            _park_arms(clients, speaker, args)
         for client in clients.values():
             _cleanup_step(f"{client.name} follower client", client.close)
         # Last and in the main thread: _terminate is bounded by construction, and this is the
         # step that must actually happen -- it is what stops the arms.
         _terminate(procs)
         n = len(state.saved_this_session)
-        print(f"[exit] {n} episode(s) saved this session -> {task_dir}")
+        print(f"[exit] {n} episode(s) saved this session ({state.n_failed} failed) -> {task_dir}")
 
 
 if __name__ == "__main__":

@@ -146,6 +146,7 @@ def get_yam_robot(
     set_realtime_and_pin_callback: Optional[Callable[[int], None]] = None,
     enable_auto_recovery: bool = False,
     use_coulomb_friction: bool = False,
+    joint_offsets: Optional[np.ndarray] = None,
     *,
     version: int = 1,
 ) -> "Robot":
@@ -169,6 +170,14 @@ def get_yam_robot(
         use_coulomb_friction: If True, add the per-joint Coulomb friction feedforward (from the arm
             config) during gravity compensation. Defaults to False. Only affects real hardware; ignored
             in sim mode (SimRobot has no friction feedforward).
+        joint_offsets: Per-arm zero-calibration correction in radians, one per arm joint,
+            ADDED to the joint angles this arm reports (and taken back out of its commands).
+            Each DM motor stores its own zero in firmware, so two physically identical arms
+            whose zeros were saved a couple of degrees apart report different angles for the
+            same pose -- which a leader/follower pair shows as the follower sitting rotated.
+            Applied at the motor chain, so reported angles, commands, FK and gravity
+            compensation all share one frame. Defaults to zeros. Real hardware only: a
+            SimRobot has no motor zeros to disagree about.
         version: Arm hardware revision. Selects both the model dir
             (``robot_models/arm/<arm>/v<N>/``) and the config (``config/<arm>_v<N>.yml``).
             Defaults to 1. Ignored when ``arm_type`` is ``NO_ARM``.
@@ -209,7 +218,22 @@ def get_yam_robot(
     kd = hw.kd.copy()
     grav_comp_kd = hw.grav_comp_kd.copy()
     coulomb_friction = hw.coulomb_friction.copy()
-    motor_offsets = [0.0] * len(motor_list)
+    # A reported angle is ``(raw - motor_offset) * direction`` and a command is the exact
+    # inverse (_joint_position_{real_to_sim,sim_to_real}_idx), so a correction that should be
+    # ADDED to the reported angle enters as ``-correction * direction`` here -- and, because
+    # it is the same number on both paths, the arm's own commands stay in the corrected frame.
+    arm_joint_offsets = np.zeros(n_arm_joints) if joint_offsets is None else np.asarray(joint_offsets, dtype=float)
+    if arm_joint_offsets.shape != (n_arm_joints,):
+        raise ValueError(
+            f"joint_offsets must have one entry per arm joint ({n_arm_joints}), got {arm_joint_offsets.shape}"
+        )
+    motor_offsets = list(-arm_joint_offsets * np.asarray(directions[:n_arm_joints], dtype=float))
+    # The mechanical stops did not move with the correction: a joint whose reading is now
+    # ``correction`` higher hits its physical lower stop ``correction`` before the model says it
+    # will (and its upper stop after). Keep only the range that both the model and the hardware
+    # can reach, so a command near the shifted stop is clipped instead of driven into it.
+    joint_limits[:, 0] += np.maximum(arm_joint_offsets, 0.0)
+    joint_limits[:, 1] += np.minimum(arm_joint_offsets, 0.0)
 
     if with_gripper:
         motor_type = gripper_type.get_motor_type(arm_type)
@@ -252,6 +276,9 @@ def get_yam_robot(
         )
 
     # --- Real hardware path ---------------------------------------------------
+
+    if np.any(arm_joint_offsets):
+        logging.info(f"zero-calibration correction (deg): {np.round(np.rad2deg(arm_joint_offsets), 3).tolist()}")
 
     # Single pass: create chain, read positions, fix wrap-around offsets in-place, then start thread.
     motor_chain = DMChainCanInterface(

@@ -65,6 +65,17 @@ run_arm() {
 
     local gripper="${YAM_GRIPPER:-$ARM_GRIPPER}"
     echo "[$ARM_LABEL] arm ${YAM_ARM:-yam} v${YAM_VERSION:-1}, gripper $gripper"
+
+    # Per-arm zero correction from scripts/arm_offsets.conf (looked up by CAN channel, like
+    # minimum_gello does), so this bring-up reports the same joint frame as teleop and policy.
+    local offset_args=() offsets
+    if (( ! user_channel )) && offsets="$("$PYTHON" "$SCRIPT_DIR/arm_offsets.py" --channel "$channel")"; then
+        if [[ "$offsets" != "0.000000 0.000000 0.000000 0.000000 0.000000 0.000000" ]]; then
+            echo "[$ARM_LABEL] zero correction (rad): $offsets  (scripts/arm_offsets.conf)"
+            # shellcheck disable=SC2206  # six space-separated numbers, split on purpose
+            offset_args=(--joint_offsets $offsets)
+        fi
+    fi
     echo "[$ARM_LABEL] starting motor_chain_robot -- the arm becomes gravity-compensated (it will move"
     echo "[$ARM_LABEL] freely by hand and hold itself up). Keep the workspace clear; Ctrl-C to stop."
     exec "$PYTHON" "$REPO_ROOT/i2rt/robots/motor_chain_robot.py" \
@@ -72,5 +83,6 @@ run_arm() {
         --version "${YAM_VERSION:-1}" \
         --gripper "$gripper" \
         ${channel_args[@]+"${channel_args[@]}"} \
+        ${offset_args[@]+"${offset_args[@]}"} \
         "$@"
 }

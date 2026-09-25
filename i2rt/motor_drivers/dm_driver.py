@@ -108,6 +108,15 @@ class PassiveEncoderReader:
         struct_format = "!B h h B"
         _device_id, position, velocity, digital_inputs = struct.unpack(struct_format, message.data)
 
+        # Position is a wrapped 12-bit absolute angle (0..4095 counts per turn), so a handle
+        # whose zero sits a hair above its resting angle reports ~4090 counts (~+6.27 rad)
+        # instead of ~-6 counts (~-0.009 rad) -- the same physical pose, one turn up. Callers
+        # treat this as a signed excursion around zero (read_encoder clips to +-range_rad),
+        # so the un-wrapped value saturates and the trigger reads as fully pressed forever.
+        # Fold the count into (-2048, 2048] before scaling; a handle already near zero is
+        # unaffected.
+        position = (position + 2048) % 4096 - 2048
+
         # Convert position and velocity to radians
         position_rad = position * 2 * np.pi / 4096
         velocity_rad = velocity * 2 * np.pi / 4096

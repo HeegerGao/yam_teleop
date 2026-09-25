@@ -1,9 +1,11 @@
 import logging
 import queue
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
 from functools import partial, wraps
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 import mujoco
@@ -162,6 +164,11 @@ class Args:
     """Use SimRobot instead of real hardware."""
     ee_mass: Optional[float] = None
     """Override end-effector (link_6) mass in kg for gravity compensation. Defaults to the value in the XML."""
+    joint_offsets: List[float] = field(default_factory=list)
+    """Six per-joint zero corrections in RADIANS, added to what this arm reports. Left empty
+    (the default) the corrections are looked up by CAN channel in scripts/arm_offsets.conf, so
+    every launcher gets them without passing anything; pass six numbers to override that, or
+    six zeros to opt out. See _resolve_joint_offsets."""
 
 
 @dataclass
@@ -175,6 +182,34 @@ class Resources:
     processes: List[portal.Process] = field(default_factory=list)
     pos_shared: Optional[portal.SharedArray] = None
     stop_event: Optional[Any] = None
+
+
+def _resolve_joint_offsets(args: "Args") -> Optional[np.ndarray]:
+    """Zero-calibration correction for the arm this process is driving, in radians.
+
+    Explicit ``--joint_offsets`` wins. Otherwise the arm is identified by its CAN channel
+    through scripts/can_map.conf and its correction read from scripts/arm_offsets.conf --
+    so a hand-edited table fixes every launcher at once instead of each one having to
+    thread six numbers through. That table lives in the deployment's scripts/ directory,
+    not in the library, so a checkout without it (or a --sim run) simply gets no correction.
+    """
+    if args.joint_offsets:
+        offsets = np.asarray(args.joint_offsets, dtype=float)
+        if offsets.shape != (6,):
+            raise ValueError(f"--joint_offsets takes 6 values (one per arm joint), got {offsets.shape[0]}")
+        return offsets
+    if args.sim:
+        return None  # sim has no motor zeros to disagree about
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+        from arm_offsets import offsets_for_channel
+    except Exception as e:
+        logging.debug(f"no per-arm zero-calibration table available ({e}); using zero offsets")
+        return None
+    offsets = offsets_for_channel(args.can_channel)
+    if np.any(offsets):
+        logging.info(f"{args.can_channel}: zero correction (deg) {np.round(np.rad2deg(offsets), 3).tolist()}")
+    return offsets
 
 
 def _spawn_into(processes: List[portal.Process], proc: portal.Process) -> portal.Process:
@@ -218,6 +253,7 @@ def _yam_polling_worker(
         ee_mass=args.ee_mass,
         sim=args.sim,
         enable_auto_recovery=enable_auto_recovery,
+        joint_offsets=_resolve_joint_offsets(args),
     )
     n_dofs_value.value = yam.num_dofs()
     rate = RateRecorder(name=rate_name, report_interval=1.0)
@@ -290,6 +326,7 @@ def _leader_control_worker(
         gripper_type=gripper_type,
         ee_mass=args.ee_mass,
         sim=args.sim,
+        joint_offsets=_resolve_joint_offsets(args),
     )
     robot = YAMLeaderRobot(yam)
     robot_current_kp = yam._kp

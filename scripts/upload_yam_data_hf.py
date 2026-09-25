@@ -16,6 +16,12 @@ half-written episode is never pushed. discarded/ is ignored.
 Auth: --token, else $HF_TOKEN / $HUGGINGFACE_HUB_TOKEN, else the cached CLI login
 (`hf auth login`). Never hard-code a token in this file.
 
+Eval rollouts (scripts/box_folding_policy_rollout.py) use the same per-directory layout without
+a task level, so they upload with:
+
+    python scripts/upload_yam_data_hf.py --data-root ~/yam_eval --task "" \
+        --episode-glob "eval_*" --repo-prefix yam_eval --all
+
 Usage:
     python scripts/upload_yam_data_hf.py --list                          # what is on disk
     python scripts/upload_yam_data_hf.py --episodes 0,2,4-6              # upload a selection
@@ -44,9 +50,13 @@ class Args:
     data_root: str = "~/yam_data"
     """Local recording root (matches --save_root of bimanual_teleop_record.py)."""
     task: str = "default_task"
-    """Task directory under data_root."""
+    """Task directory under data_root. Empty means the episodes sit directly in data_root
+    (the layout box_folding_policy_rollout.py writes: ~/yam_eval/eval_<stamp>/)."""
+    episode_glob: str = "episode_*"
+    """Which directories count as episodes. Eval rollouts are "eval_*"."""
     episodes: str = ""
-    """Which episodes to upload: "0,2,4-6", "episode_0003", or a mix. Empty means none."""
+    """Which episodes to upload: "0,2,4-6", "episode_0003", a full directory name, or a mix.
+    Empty means none."""
     all: bool = False
     """Upload every complete episode of the task (ignores --episodes)."""
     repo_prefix: str = "yam_data"
@@ -68,23 +78,28 @@ class Args:
 
 
 def _task_dir(args: Args) -> Path:
-    return Path(args.data_root).expanduser() / args.task
+    root = Path(args.data_root).expanduser()
+    return root / args.task if args.task else root
 
 
-def _find_episodes(task_dir: Path) -> List[Path]:
+def _find_episodes(task_dir: Path, pattern: str = "episode_*") -> List[Path]:
     """Complete episode dirs (meta.json present), sorted by name; discarded/ excluded."""
     if not task_dir.is_dir():
         sys.exit(f"[error] task directory not found: {task_dir}")
-    return sorted(p for p in task_dir.glob("episode_*") if p.is_dir() and (p / META_FILE).is_file())
+    return sorted(p for p in task_dir.glob(pattern) if p.is_dir() and (p / META_FILE).is_file())
 
 
 def _parse_selection(spec: str) -> Set[str]:
-    """Turn "0,2,4-6,episode_0009" into {"episode_0000", "episode_0002", ...}."""
+    """Turn "0,2,4-6,episode_0009" into {"episode_0000", "episode_0002", ...}.
+
+    A token that is not a number or a number range is taken as a directory name verbatim, so
+    non-numbered runs (``eval_20260821_113728``) can be selected the same way.
+    """
     names: Set[str] = set()
     for raw in spec.replace(" ", "").split(","):
         if not raw:
             continue
-        if raw.startswith("episode_"):
+        if not raw.replace("-", "").isdigit():
             names.add(raw)
         elif "-" in raw.strip("-"):
             lo_s, hi_s = raw.split("-", 1)
@@ -138,7 +153,7 @@ def _resolve_token(args: Args) -> Optional[str]:
 
 def main(args: Args) -> None:
     task_dir = _task_dir(args)
-    available = _find_episodes(task_dir)
+    available = _find_episodes(task_dir, args.episode_glob)
 
     if args.list:
         print(f"[list] {task_dir}  ({len(available)} complete episode(s))")

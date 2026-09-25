@@ -3,7 +3,7 @@ import logging
 import os
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 
@@ -726,6 +726,10 @@ class _CliArgs:
     """Operation mode: gravity compensation, gripper cycling, or holding the startup joint positions."""
     record: bool = False
     """Record motor feedback and computed required torques to a ROS 2 CDR MCAP file."""
+    joint_offsets: List[float] = field(default_factory=list)
+    """Six per-joint zero corrections in radians, added to what this arm reports (see
+    get_yam_robot's joint_offsets). Empty = none. scripts/run_*.sh fill this from
+    scripts/arm_offsets.conf."""
 
 
 if __name__ == "__main__":
@@ -742,7 +746,15 @@ if __name__ == "__main__":
     gripper_type = GripperType.from_string_name(args.gripper)
 
     print(f"Initializing robot with arm_type: {arm_type}, gripper_type: {gripper_type}")
-    robot = get_yam_robot(args.channel, arm_type=arm_type, version=args.version, gripper_type=gripper_type)
+    if args.joint_offsets and len(args.joint_offsets) != 6:
+        raise SystemExit(f"--joint_offsets takes 6 values, got {len(args.joint_offsets)}")
+    robot = get_yam_robot(
+        args.channel,
+        arm_type=arm_type,
+        version=args.version,
+        gripper_type=gripper_type,
+        joint_offsets=np.asarray(args.joint_offsets) if args.joint_offsets else None,
+    )
 
     try:
         if args.record:
